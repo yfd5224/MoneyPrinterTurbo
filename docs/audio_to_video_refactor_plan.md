@@ -1,242 +1,258 @@
-# 音频驱动生成视频 —— 改造方案
+# 音频 → 视频 改造方案（基于 MoneyPrinterTurbo）
 
-> 目标：把现有「输入主题 → LLM 生成文案 → TTS 配音 → 匹配素材 → 合成」的流程，
-> 改成「上传一段配音音频 → 按句子拆分 → 每句匹配一个画面 → 音频转字幕 → 合成输出视频」。
->
-> 约束：
-> - 音频只用用户上传的，不做 TTS、不做背景音乐、不做变速、不做音量调节。
-> - 字幕用 **faster-whisper 本地识别**（带时间戳）。
-> - 画面素材来源：**Pexels**（保留 Pixabay / Coverr 等可选搜索源的配置能力）。
-> - 拆分粒度：**尽量一句话一个画面**。
-> - 没用到的代码 **不删除，只注释**，目的是启动时少装一堆包。
+> 目标：把入口从「主题文案自动生成」改成「上传一段中文配音音频」，
+> 流程变为：**上传音频 → 按句拆分 → 每句匹配画面 → 音频转字幕 → 合成视频**。
+> 不要 TTS、不要背景音乐、不要变速、不要跨平台发布。
+> 用不到的代码**不删，只注释**；目标之一是启动时少装一堆包。
 
----
+## 最终确认结论（你已拍板）
 
-## 1. 现有流程梳理（改造前）
-
-入口：`webui/Main.py`（Streamlit）/ `app/router.py`（FastAPI）→ `app/services/task.py: start()`
-
-`start()` 的 7 个步骤：
-
-| 步骤 | 函数 | 说明 | 改造后 |
-|------|------|------|--------|
-| 1. 生成文案 | `generate_script` | 没有 `video_script` 时调用 `llm.generate_script` | **删/注释**（改为从音频识别得到文本） |
-| 2. 生成关键词 | `generate_terms` | 调用 `llm.generate_terms` 生成搜索词 | **改造**（改成按字幕句子逐句生成关键词） |
-| 3. 生成音频 | `generate_audio` | 有 `custom_audio_file` 用上传音频，否则 TTS | **简化**（只保留上传音频分支） |
-| 4. 生成字幕 | `generate_subtitle` | `edge` 用 TTS 时间戳，否则 `whisper` | **简化**（强制走 whisper） |
-| 5. 获取素材 | `get_video_materials` | 本地素材 or 在线下载 | **改造**（改成逐句匹配下载） |
-| 6. 合成视频 | `generate_final_videos` → `video.combine_videos` | 按音频总时长堆素材 | **改造**（改成按字幕时间轴逐句放画面） |
-| 7. 跨平台发布 | `upload_post` | 自动上传到 YouTube/TikTok 等 | **删/注释**（不需要） |
-
-### 关键发现：当前画面和字幕是**不对齐**的
-
-`combine_videos`（`app/services/video.py:535`）现在的逻辑是：把所有下载的素材切成小片段，
-然后**按音频总时长**一段段拼接，直到盖住音频长度为止。它**完全不看字幕时间戳**，
-所以"一句话对应一个画面"目前是做不到的 —— 这是本次改造的核心新增逻辑。
-
-### 当前画面匹配（搜索词）怎么来的
-
-`llm.generate_terms(video_subject, video_script, amount)` 用大模型从整篇文案里提炼出
-一组英文搜索词，再丢给 Pexels 搜索。也就是说**当前完全依赖 LLM**，而且是"整篇一组词"，
-不是"逐句一组词"。
+- **LLM 提供商：全部保留**（用来把中文句子提炼成英文画面关键词，保证画面质量）。
+- **字幕识别：whisper 本地 + DashScope 在线 两种都保留**，界面/配置可切换。
+  - whisper 默认模型 `large-v3`（中文最准，CPU 慢可改 medium）。
+  - DashScope 在线用阿里 Paraformer 语音识别（更快，依赖网络 + key）。
+- **入口：Streamlit 界面 + FastAPI 接口 两个都改**。
 
 ---
 
-## 2. 改造后目标流程
+## 一、新流程总览
 
 ```
-上传音频 (audio.mp3/wav)
+上传音频(.mp3/.wav)
    │
    ▼
-[whisper 本地识别] → 句子级字幕 (text + start + end)   ← subtitle.create()
+[1] 语音识别（whisper 本地 / DashScope 在线，二选一）→ 句子级字幕(带时间戳 start/end)
    │
    ▼
-[逐句生成画面关键词]
-   ├─ 方案 A：LLM 逐句提炼英文关键词（保留，需要 LLM 包 + key）
-   └─ 方案 B：直接用字幕文本/分词做关键词（默认，可关掉所有 LLM 包）
+[2] 遍历每句字幕文本 → LLM 把「中文句子」提炼成「英文画面关键词」
    │
    ▼
-[逐句搜索 + 下载素材] (Pexels / Pixabay / Coverr)   ← material.py
+[3] 每句按关键词去 Pexels(可选 Pixabay/Coverr) 搜索并下载 1 个画面素材
    │
    ▼
-[按字幕时间轴逐句拼接画面] 第 i 句字幕时长 = 第 i 个画面时长   ← video.combine_videos 改造
+[4] 按字幕时间轴拼接：第 i 句的画面时长 = 该句 end - start（一句一画面）
    │
    ▼
-[烧录字幕] generate_video()（保留）
-   │
-   ▼
-输出 final-1.mp4
+[5] 叠加字幕 + 挂上原始音频 → 输出最终视频
 ```
 
-新的 `start()` 步骤简化为：
-
-1. 解析上传音频，拿到时长。
-2. whisper 识别音频 → 句子级字幕（带时间戳）。
-3. 逐句生成画面关键词（LLM 或直接文本）。
-4. 逐句搜索 + 下载素材。
-5. 按字幕时间轴逐句拼接画面 → 合成。
-6. 烧录字幕、输出视频。
+与原流程对比（原：生成文案 → 生成关键词 → TTS 配音 → 字幕 → 下载素材 → 合成 → 发布），
+本次**砍掉** generate_script / TTS / 背景音乐 / 跨平台发布；**新增** “按句匹配画面 + 按时间轴拼接 + 在线 ASR”。
 
 ---
 
-## 3. 逐文件改造清单
+## 二、关键现状分析（决定改造难度）
 
-### 3.1 `app/models/schema.py`
+逐文件读过代码后，有几个必须知道的点：
 
-`VideoParams` 新增 / 调整字段（建议保留旧字段不删，只是用不到）：
+1. **`task.py` 已支持 `custom_audio_file`**：`generate_audio()` 的 else 分支直接用上传音频，
+   并返回 `sub_maker=None`。所以“用上传音频”不用从零做，主要是**改编排顺序**。
+
+2. **`subtitle.py` 的 whisper 已是“句子级 + 时间戳”**（按标点断句，输出 `start_time/end_time`），
+   非常契合“一句一画面”。**当前只有本地 whisper，没有在线识别**——在线识别要新增。
+
+3. **最大的改造点在 `video.py` 的 `combine_videos()`**：
+   它现在**按音频总时长堆素材**（`required_video_duration = 音频时长`，素材循环填满），
+   **完全不看字幕时间戳**。所以“画面跟着句子切换”**目前实现不了**，
+   必须**新增按时间轴拼接的函数**（`combine_videos_by_timeline`）。
+
+4. **`material.py`** 已有 Pexels/Pixabay/Coverr 三个搜索源 + 顺序匹配逻辑，
+   但是“一批关键词整体下载”，需新增“**按句**，每句下 1 个”的函数。
+
+5. **中文直接搜 Pexels 几乎搜不到**（Pexels 主要吃英文），所以**保留 LLM 做中文→英文关键词**
+   是画面质量关键（已按你的要求保留全部 LLM 提供商）。
+
+---
+
+## 三、逐文件改造清单
+
+### 1. `app/models/schema.py`（参数模型）
+
+`VideoParams` 新增/调整字段（旧字段保留不删，新增的给默认值即可向后兼容）：
 
 ```python
-# 新增：明确这是“音频驱动”模式
-audio_driven: bool = True
-# custom_audio_file 已存在，继续用它接收上传音频路径
+class VideoParams(BaseModel):
+    # ===== 新流程核心参数 =====
+    custom_audio_file: str = ""        # 上传的音频路径（已存在字段，继续用）
+    asr_provider: str = "whisper"      # "whisper"(本地) | "dashscope"(在线)
+    keyword_by_llm: bool = True        # True=用LLM把中文句子转英文关键词
+    min_scene_duration: float = 2.0    # 最短画面时长，短句合并用（见风险点）
 
-# 用不到但先保留（不删），避免别处引用报错：
-# video_subject / video_script / video_terms
-# voice_name / voice_rate / voice_volume
-# bgm_type / bgm_file / bgm_volume
+    # video_subject 目前是必填，音频驱动下没有主题，改成可选避免构造报错：
+    # video_subject: Optional[str] = ""
+
+    # ===== 旧字段保留默认值，不要删（webui/api 可能仍引用）=====
+    # video_script / video_terms / paragraph_number
+    # voice_name / voice_rate / voice_volume / bgm_type / bgm_file / bgm_volume ...
 ```
 
-> 说明：`video_subject` 目前是必填（`video_subject: str`）。音频驱动模式下没有主题，
-> 建议改成 `video_subject: Optional[str] = ""`，否则构造 `VideoParams` 会报错。
+---
 
-新增一个"逐句关键词来源"的开关（也可以放 config.toml）：
+### 2. `app/services/task.py`（流程编排，**改动最大**）
 
-```python
-# "llm" 用大模型逐句提炼英文关键词；"text" 直接用字幕文本/分词
-term_source: Optional[str] = "text"
+`start()` 重排为新流程；旧逻辑用注释包起来保留。
+
+- **`generate_script()`**：上传音频模式**跳过**（注释原调用）。`video_script` 置空或等识别后回填。
+- **`generate_terms()`**：不再整体生成，改为“按句生成关键词”（见下，注释原整体调用）。
+- **`generate_audio()`**：只保留 `else`(custom_audio_file) 分支；
+  `if not custom_audio_file:` 的 TTS 分支整段注释。没有上传音频直接判失败。
+- **`generate_subtitle()`**：强制走 ASR。把 `if subtitle_provider == "edge"` 整段注释，
+  按 `params.asr_provider` 调 `subtitle.create()`(whisper) 或新增的
+  `subtitle.create_by_dashscope()`(在线)。**不要再调用 `subtitle.correct()`**
+  （原 correct 拿 LLM 文案校正字幕，新流程没有原始文案）。
+- **新增 `build_segments_and_materials(subtitles, params)`**：
+  - 读字幕得到 `[(start, end, 中文文本), ...]`（用现有 `subtitle.file_to_subtitles()`）。
+  - 可选“短句合并”（< `min_scene_duration` 的相邻句合并成一个画面段）。
+  - 每段：`关键词 = llm.generate_terms(该句)` → `material.download_one_video(关键词)` → `clip_path`。
+  - 产出 `segments = [{start, end, text, clip_path}, ...]`。
+- **`generate_final_videos()`**：调用新增的 `video.combine_videos_by_timeline(segments, ...)`，
+  原 `video.combine_videos()` 调用注释保留。
+- **第 7 步跨平台发布**：整段注释（`upload_post` 相关）。
+
+`start()` 新顺序：
+```
+update(progress=5)
+audio_file, audio_duration = use_uploaded_audio()          # 取代 generate_audio 的 TTS
+subtitle_path, subs        = generate_subtitle_by_asr()    # whisper / dashscope
+segments                   = build_segments_and_materials(subs)  # 按句关键词+按句下素材
+combined                   = video.combine_videos_by_timeline(segments)  # 按时间轴拼接
+final                      = video.generate_video(combined, audio, subtitle)  # 叠字幕+挂音频
+update(progress=100, ...)
 ```
 
-### 3.2 `app/services/task.py`
+---
 
-- `start()`：
-  - **注释掉** 步骤 1 `generate_script` 调用（保留函数定义）。
-  - **注释掉** 步骤 2 中"整篇生成关键词"的逻辑；改为在拿到字幕后逐句生成。
-  - **注释掉** 步骤 7 `upload_post` 整段。
-  - `generate_audio`：保留 `custom_audio_file` 分支，**注释掉** TTS 分支（`voice.tts(...)`）。
-    没有上传音频时直接判失败。
-  - `generate_subtitle`：**注释掉** `edge` 分支，强制走 `subtitle.create(audio_file, subtitle_file)`。
-    `subtitle.correct(...)` 依赖原始文案做纠错，音频驱动下没有"标准文案"，
-    **建议注释掉 correct**，直接用 whisper 原始识别结果。
-- 新增函数（建议）：
-  - `build_segment_terms(subtitles, params)`：输入字幕列表，输出 `[(start, end, [terms...]), ...]`。
-    - `term_source == "llm"`：对每句调用 `llm.generate_terms`（或新写一个逐句版）。
-    - `term_source == "text"`：用字幕文本本身/`jieba` 分词当关键词（见 §5 中文问题）。
-  - `download_materials_per_segment(...)`：对每句的关键词搜索并下载 1 个素材，
-    返回**按句顺序**的素材路径列表（顺序很重要）。
+### 3. `app/services/subtitle.py`（字幕识别，两种都保留）
 
-### 3.3 `app/services/subtitle.py`
+- **本地 whisper**：基本不动（已是句子级+时间戳）。
+  `from faster_whisper import WhisperModel` 已是 try/except 延迟保护，注释包后也不崩。
+- **新增在线 `create_by_dashscope(audio_file, subtitle_file)`**：
+  调用阿里 DashScope 语音识别（Paraformer，如 `paraformer-v2`），
+  把返回的句子+时间戳写成同样 `.srt`（复用 `utils.text_to_srt`）。
+  → key 复用现有 `qwen_api_key`（DashScope 通用）或新增 `[dashscope] api_key`。
+- `correct()`：新流程不调用，保留函数体。
 
-- 基本不用改，`create()` 已经是 whisper 句子级识别（按标点断句，带时间戳）。
-- `correct()` 在音频驱动模式下不调用即可（不用删）。
-- 需要把每条字幕的 `start/end` 暴露给 task.py 用来对齐画面 —— 
-  现在写进 `.srt` 文件，再用 `file_to_subtitles()` 读回来即可（已有该函数）。
+---
 
-### 3.4 `app/services/material.py`
+### 4. `app/services/material.py`（素材下载）
 
-- 搜索源逻辑**保留**（Pexels / Pixabay / Coverr 都留着，由 `video_source` 切换）。
-- 新增 `download_one_video(search_term, ...)`：只下载该关键词的 **1 个**合适素材，
-  供"逐句匹配"调用。现有 `download_videos` 是"按总时长批量下载"，保留即可。
+- 三个搜索源 `search_videos_pexels/pixabay/coverr` **全部保留**（Pexels 为主，其余备用）。
+- **新增 `download_one_video(search_term, video_aspect, min_duration)`**：
+  搜该关键词 → 取第 1 个满足时长的素材 → `save_video()` → 返回本地路径。
+  搜不到时降级：换备用源 / 用通用兜底词（city/nature）/ 复用上一句画面。
+- 原 `download_videos()` / `_download_videos_by_script_order()` 保留不动。
 
-### 3.5 `app/services/video.py` —— 核心改造
+---
 
-`combine_videos` 现在不看时间戳。新增一个对齐版本（建议新函数，旧的保留注释或留作 fallback）：
+### 5. `app/services/video.py`（**新增按时间轴拼接**，核心）
+
+新增函数（原 `combine_videos` 完整保留不删）：
 
 ```python
 def combine_videos_by_timeline(
-    combined_video_path,
-    segment_clips,   # [(start, end, video_path), ...] 按句顺序
-    audio_file,
-    video_aspect,
-    ...
-):
-    # 对每一句：取该句对应素材，裁剪/循环到 (end - start) 这么长
-    # 缩放 + letterbox 到目标分辨率（复用现有 resize 逻辑）
-    # 按顺序拼接 → 总时长 == 音频时长
+    combined_video_path: str,
+    segments: list,          # [{start, end, clip_path}, ...] 来自字幕时间轴
+    audio_file: str,
+    video_aspect=VideoAspect.portrait,
+    threads=2,
+) -> str:
+    """
+    一句一画面：第 i 个片段时长 = segments[i].end - segments[i].start。
+    每个 clip：截取/循环到目标时长 → resize+letterbox 到目标分辨率
+    （复用现有逻辑）→ 顺序 concat；总时长对齐音频时长。
+    """
 ```
 
-要点：
-- 每个画面时长 = 该句字幕 `end - start`，**不再**按"凑满音频总时长"来堆。
-- 素材比该句短就循环，比该句长就裁剪。
-- `generate_video()`（烧字幕）保留不动。
-
-### 3.6 入口 `webui/Main.py` / `app/router.py`
-
-- Streamlit 界面：
-  - **注释掉** 主题输入、文案生成、配音(voice)、背景音乐(bgm) 相关 UI。
-  - 保留/强化 **音频上传** 控件，把路径塞进 `custom_audio_file`。
-  - 保留 视频比例、字幕样式、`video_source`(Pexels)、`term_source` 等控件。
-- FastAPI：保留 `/video` 任务接口，确保能接收 `custom_audio_file`。
+实现要点：
+- 复用现有 resize / 居中 letterbox / `concat_video_clips_with_ffmpeg` / 编码回退逻辑。
+- 素材短于该句 → 循环或定格尾帧（不变速更安全）；长于该句 → `subclipped(0, 句时长)` 截断。
+- `generate_video()`（叠字幕+挂音频）**基本不动**，继续复用。
 
 ---
 
-## 4. 依赖瘦身（`requirements.txt` / `pyproject.toml`）
+### 6. LLM（`app/services/llm.py`，全部保留）
 
-> 原则：用不到的**注释掉**，启动时不安装。下面是按本方案的判断，最终以你确认为准。
+- 所有提供商保留。复用/新增 `generate_terms()` 的“单句”用法：
+  输入一句中文，输出 3~5 个英文画面关键词。
+  prompt 改为：“给定一句中文旁白，输出最适合作为空镜/B-roll 画面搜索的英文关键词”。
+- 原 `generate_script` / `generate_social_metadata` 保留不动（新流程不调用）。
+
+---
+
+### 7. 入口（两个都改）
+
+- **Streamlit `webui/`**：
+  - 新增「上传音频」控件（`st.file_uploader`，存到 task 目录，写入 `custom_audio_file`）。
+  - 注释隐藏：主题输入、文案编辑、TTS 音色/语速/音量、背景音乐相关 UI。
+  - 新增：ASR 方式(whisper/dashscope)、画面比例、素材源、是否用 LLM 关键词、最短画面时长。
+- **FastAPI `app/`（router/controller）**：
+  - 新增上传音频接口（`multipart/form-data`）或复用现有 `/tasks` + `custom_audio_file`。
+  - 任务请求体对齐新的 `VideoParams` 字段。
+
+---
+
+## 四、依赖瘦身（注释 + 延迟导入，避免启动即崩）
+
+> 原则：**先注释使用处 → 再把顶层 import 改延迟/try 导入 → 最后注释包**。
+> 否则注释了包、代码顶层还 `import` 就直接崩。`subtitle.py` 的 try/except 写法可照抄。
+
+可注释掉的包：
 
 | 包 | 用途 | 处理 |
-|----|------|------|
-| `moviepy` | 视频合成 | **保留** |
-| `faster-whisper` | 本地字幕识别 | **保留** |
-| `fastapi` / `uvicorn` | API 服务 | 保留（用 API 才需要） |
-| `streamlit` | Web 界面 | 保留（用界面才需要） |
-| `requests` / `socksio` | 素材下载 | **保留** |
-| `loguru` / `pyyaml` | 日志/配置 | **保留** |
-| `python-multipart` | 上传音频 | **保留** |
-| `edge_tts` | TTS 配音 | **注释**（不配音） |
-| `azure-cognitiveservices-speech` | Azure TTS | **注释** |
-| `pydub` | 音频处理(BGM/拼接) | **注释**（不处理音频，但需确认 §5） |
-| `openai` | LLM | term_source=llm 才需要，否则**注释** |
-| `google.generativeai` | Gemini | 同上，默认**注释** |
-| `dashscope` | 通义 | 同上，默认**注释** |
-| `litellm` | LLM 聚合 | 同上，默认**注释** |
-| `redis` | 任务队列状态 | 看部署模式，单机内存模式可**注释** |
+|---|---|---|
+| `edge_tts` | TTS 配音 | 注释 voice.py 用法 + import |
+| `azure-cognitiveservices-speech` | Azure TTS | 同上 |
+| `elevenlabs` / siliconflow 相关 | TTS | 同上 |
+| `redis` | 任务状态（默认 enable_redis=false） | 注释 import |
+| `pydub` | 音频处理(变速/BGM) | 注释 BGM/变速用法 + import |
+| `upload_post` 相关 | 跨平台发布 | 注释整模块用法 + import |
 
-> 注意：直接注释 `requirements.txt` 不够，代码里 `import openai` 等会在导入时报错。
-> 配套要做的是把 `app/services/llm.py`、`voice.py`、`upload_post.py` 里对这些包的
-> **顶层 import 改成「延迟导入」或 try/except**，否则注释了包但代码一 import 就崩。
-> 当前 `subtitle.py` 已经用了 `try: from faster_whisper import ... except ImportError:` 这种写法，
-> 可以照抄这个模式。
+**必须保留**：`faster-whisper`(本地ASR)、`dashscope`(在线ASR + 可做关键词)、
+全部 LLM 包(openai/gemini/qwen/litellm... 你要求保留)、
+`moviepy`/`imageio-ffmpeg`/`Pillow`/`numpy`(合成)、`requests`(下载)、
+`fastapi`/`uvicorn`/`streamlit`(入口)、`loguru`/`pyyaml`/`python-multipart`。
 
 ---
 
-## 5. 需要你拍板的几个点（重要）
+## 五、配置变更（`config.example.toml`）
 
-### (1) 中文字幕 → Pexels 搜索的语言问题 ⚠️
-Pexels 主要按**英文**关键词搜索。如果 `term_source="text"` 直接拿中文字幕去搜，
-大概率搜不到合适素材。可选：
-- **A：保留 LLM**，让它把中文句子翻译+提炼成英文画面关键词（效果最好，但要装 LLM 包 + 配 key）。
-- **B：不用 LLM**，但接一个轻量翻译（如本地词典/小翻译接口），或者你的音频本身是英文。
-- **C：先用 text 跑通流程，画面质量后面再优化。**
-
-> 你倾向哪种？这直接决定 LLM 那几个包到底注释不注释。
-
-### (2) whisper 模型大小
-`config.toml` 里 `whisper.model_size`（默认 `large-v3`，约 3GB）。
-本地识别精度高但下载慢、占内存。要不要默认改成 `medium` 或 `small` 平衡速度？
-
-### (3) "一句话一个画面" 太碎怎么办
-whisper 按标点断句，有些句子可能只有 1~2 秒，画面切太快会晃。
-是否需要一个"最短画面时长"（比如 < 2 秒的相邻句子合并成一个画面）？
-
-### (4) 素材搜不到时的兜底
-某一句关键词在 Pexels 搜不到素材时，怎么办？
-- 用上一个画面延续 / 用一个默认空镜 / 用纯色背景？
-
-### (5) `pydub` 是否真的能去掉
-合成时如果完全不碰音频（直接把上传音频塞进视频轨），`pydub` 可以注释。
-但要确认 `video.py` 合成那段没有用 pydub 做音频处理。我会在实现时核对。
+- `subtitle_provider`：语义改为 ASR 选择，默认 `"whisper"`，可选 `"dashscope"`
+  （或在 schema 用 `asr_provider`，二者取其一，建议统一）。
+- `[whisper] model_size = "large-v3"`（中文最准；CPU 慢可改 medium）。
+- 新增（可选）`[dashscope] api_key`，或直接复用 `qwen_api_key`。
+- TTS / BGM / upload_post 配置项**保留但注释“新流程未使用”**。
 
 ---
 
-## 6. 建议的改动顺序（你自己改的话）
+## 六、建议实施顺序
 
-1. **先改 `schema.py`**：`video_subject` 改可选，加 `term_source`。
-2. **改 `task.py: start()`**：注释 script/terms/tts/upload，串起新流程骨架。
-3. **改 `generate_audio` / `generate_subtitle`**：只走上传音频 + whisper。
-4. **新增逐句关键词 + 逐句下载**（material.py + task.py）。
-5. **新增 `combine_videos_by_timeline`**（video.py），按时间轴对齐画面。
-6. **改入口 UI**（webui/Main.py），只留音频上传 + 必要参数。
-7. **最后再动 `requirements.txt`**，配合把 llm/voice/upload 的顶层 import 改成延迟/try-except。
+1. `schema.py` 加字段（最小、向后兼容）。
+2. `subtitle.py` 加 `create_by_dashscope()`（本地 whisper 已可用，先打通在线）。
+3. `material.py` 加 `download_one_video()`。
+4. `video.py` 加 `combine_videos_by_timeline()`（核心，单独写脚本测一段音频）。
+5. `llm.py` 让 `generate_terms()` 支持“单句→英文关键词”。
+6. `task.py` 重排 `start()`，串起 2→5（旧逻辑注释保留）。
+7. 改 `webui` + `api` 入口。
+8. 最后做依赖瘦身（先延迟 import，再注释包）。
 
-> 先保证流程跑通（text 关键词 + 不删包），再做依赖瘦身，风险最低。
-```
+> 先保证流程跑通（不删包），再做依赖瘦身，风险最低。
+
+---
+
+## 七、风险与注意点
+
+- **画面切换太碎**：中文一句可能只有 1~2 秒，画面频繁闪。用 `min_scene_duration`
+  把过短的相邻句合并成一个画面（在 `build_segments_and_materials` 里做）。
+- **Pexels 配额**：按句下载请求量大，用多 key 轮询（已支持）+ 失败降级兜底。
+- **whisper large-v3 在 CPU 上很慢**：无 GPU 时长音频识别耗时明显，可优先选 dashscope 在线。
+- **素材时长不足该句**：不变速前提下用“循环/定格尾帧”，避免黑屏或拉伸变形。
+- **字幕与音频对齐**：直接用 ASR 时间戳，天然对齐，无需 `subtitle.correct()`。
+
+---
+
+## 八、改之前可再拍板的细节（非阻塞）
+
+1. **DashScope key**：复用现有 `qwen_api_key`，还是新建 `[dashscope] api_key`？（建议复用）
+2. **素材搜不到的兜底**：通用关键词兜底 / 复用上一句画面 / 纯色背景？（建议：先备用源，再通用词，最后复用上一句）
+3. **画面比例默认**：竖屏 9:16 还是横屏 16:9？（Pexels 竖屏少、Coverr 偏横屏）
+4. **最短画面时长默认值**：建议 2 秒，可在界面调。
