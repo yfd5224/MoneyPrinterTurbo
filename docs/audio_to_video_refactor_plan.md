@@ -8,10 +8,13 @@
 ## 最终确认结论（你已拍板）
 
 - **LLM 提供商：全部保留**（用来把中文句子提炼成英文画面关键词，保证画面质量）。
-- **字幕识别：whisper 本地 + DashScope 在线 两种都保留**，界面/配置可切换。
-  - whisper 默认模型 `large-v3`（中文最准，CPU 慢可改 medium）。
-  - DashScope 在线用阿里 Paraformer 语音识别（更快，依赖网络 + key）。
+- **字幕识别：仅 faster-whisper 本地识别**，默认 `small` 模型。
+  - 不做在线识别（DashScope/Paraformer 方案已取消，不再保留切换）。
+- **TTS / 语音合成模块：删除（注释掉）**，仅支持上传音频。
 - **入口：Streamlit 界面 + FastAPI 接口 两个都改**。
+
+> 与早期版本的差异：① ASR 从「whisper + DashScope 双方案」简化为「仅 whisper」；
+> ② whisper 默认模型从 `large-v3` 降为 `small`；③ 明确删除 TTS 模块。
 
 ---
 
@@ -21,7 +24,7 @@
 上传音频(.mp3/.wav)
    │
    ▼
-[1] 语音识别（whisper 本地 / DashScope 在线，二选一）→ 句子级字幕(带时间戳 start/end)
+[1] 语音识别（faster-whisper 本地，small 模型）→ 句子级字幕(带时间戳 start/end)
    │
    ▼
 [2] 遍历每句字幕文本 → LLM 把「中文句子」提炼成「英文画面关键词」
@@ -49,7 +52,7 @@
    并返回 `sub_maker=None`。所以“用上传音频”不用从零做，主要是**改编排顺序**。
 
 2. **`subtitle.py` 的 whisper 已是“句子级 + 时间戳”**（按标点断句，输出 `start_time/end_time`），
-   非常契合“一句一画面”。**当前只有本地 whisper，没有在线识别**——在线识别要新增。
+   非常契合“一句一画面”。**直接复用本地 whisper 即可，无需新增任何识别方式**（默认模型改成 `small`）。
 
 3. **最大的改造点在 `video.py` 的 `combine_videos()`**：
    它现在**按音频总时长堆素材**（`required_video_duration = 音频时长`，素材循环填满），
@@ -74,9 +77,9 @@
 class VideoParams(BaseModel):
     # ===== 新流程核心参数 =====
     custom_audio_file: str = ""        # 上传的音频路径（已存在字段，继续用）
-    asr_provider: str = "whisper"      # "whisper"(本地) | "dashscope"(在线)
     keyword_by_llm: bool = True        # True=用LLM把中文句子转英文关键词
     min_scene_duration: float = 2.0    # 最短画面时长，短句合并用（见风险点）
+    # ASR 固定为本地 whisper，不再需要 provider 字段；whisper 模型在 config 里配置（默认 small）
 
     # video_subject 目前是必填，音频驱动下没有主题，改成可选避免构造报错：
     # video_subject: Optional[str] = ""
@@ -96,9 +99,8 @@ class VideoParams(BaseModel):
 - **`generate_terms()`**：不再整体生成，改为“按句生成关键词”（见下，注释原整体调用）。
 - **`generate_audio()`**：只保留 `else`(custom_audio_file) 分支；
   `if not custom_audio_file:` 的 TTS 分支整段注释。没有上传音频直接判失败。
-- **`generate_subtitle()`**：强制走 ASR。把 `if subtitle_provider == "edge"` 整段注释，
-  按 `params.asr_provider` 调 `subtitle.create()`(whisper) 或新增的
-  `subtitle.create_by_dashscope()`(在线)。**不要再调用 `subtitle.correct()`**
+- **`generate_subtitle()`**：强制走本地 whisper。把 `if subtitle_provider == "edge"` 整段注释，
+  直接调 `subtitle.create()`(whisper)。**不要再调用 `subtitle.correct()`**
   （原 correct 拿 LLM 文案校正字幕，新流程没有原始文案）。
 - **新增 `build_segments_and_materials(subtitles, params)`**：
   - 读字幕得到 `[(start, end, 中文文本), ...]`（用现有 `subtitle.file_to_subtitles()`）。
@@ -113,7 +115,7 @@ class VideoParams(BaseModel):
 ```
 update(progress=5)
 audio_file, audio_duration = use_uploaded_audio()          # 取代 generate_audio 的 TTS
-subtitle_path, subs        = generate_subtitle_by_asr()    # whisper / dashscope
+subtitle_path, subs        = generate_subtitle_by_whisper()# 本地 whisper(small)
 segments                   = build_segments_and_materials(subs)  # 按句关键词+按句下素材
 combined                   = video.combine_videos_by_timeline(segments)  # 按时间轴拼接
 final                      = video.generate_video(combined, audio, subtitle)  # 叠字幕+挂音频
@@ -122,14 +124,12 @@ update(progress=100, ...)
 
 ---
 
-### 3. `app/services/subtitle.py`（字幕识别，两种都保留）
+### 3. `app/services/subtitle.py`（字幕识别，仅本地 whisper）
 
-- **本地 whisper**：基本不动（已是句子级+时间戳）。
-  `from faster_whisper import WhisperModel` 已是 try/except 延迟保护，注释包后也不崩。
-- **新增在线 `create_by_dashscope(audio_file, subtitle_file)`**：
-  调用阿里 DashScope 语音识别（Paraformer，如 `paraformer-v2`），
-  把返回的句子+时间戳写成同样 `.srt`（复用 `utils.text_to_srt`）。
-  → key 复用现有 `qwen_api_key`（DashScope 通用）或新增 `[dashscope] api_key`。
+- **本地 whisper**：基本不动（已是句子级+时间戳），直接复用 `create()`。
+  `from faster_whisper import WhisperModel` 已是 try/except 延迟保护。
+  只需把默认模型大小调成 `small`（在 config / `[whisper] model_size` 处）。
+- **不新增任何在线识别**（DashScope/Paraformer 方案已取消）。
 - `correct()`：新流程不调用，保留函数体。
 
 ---
@@ -184,7 +184,7 @@ def combine_videos_by_timeline(
 - **Streamlit `webui/`**：
   - 新增「上传音频」控件（`st.file_uploader`，存到 task 目录，写入 `custom_audio_file`）。
   - 注释隐藏：主题输入、文案编辑、TTS 音色/语速/音量、背景音乐相关 UI。
-  - 新增：ASR 方式(whisper/dashscope)、画面比例、素材源、是否用 LLM 关键词、最短画面时长。
+  - 新增：画面比例、素材源、是否用 LLM 关键词、最短画面时长（ASR 固定 whisper，无需选项）。
 - **FastAPI `app/`（router/controller）**：
   - 新增上传音频接口（`multipart/form-data`）或复用现有 `/tasks` + `custom_audio_file`。
   - 任务请求体对齐新的 `VideoParams` 字段。
@@ -207,19 +207,19 @@ def combine_videos_by_timeline(
 | `pydub` | 音频处理(变速/BGM) | 注释 BGM/变速用法 + import |
 | `upload_post` 相关 | 跨平台发布 | 注释整模块用法 + import |
 
-**必须保留**：`faster-whisper`(本地ASR)、`dashscope`(在线ASR + 可做关键词)、
-全部 LLM 包(openai/gemini/qwen/litellm... 你要求保留)、
+**必须保留**：`faster-whisper`(本地 ASR，唯一识别方式)、
+全部 LLM 包(openai/gemini/qwen/dashscope/litellm... 你要求保留，用于中文→英文关键词)、
 `moviepy`/`imageio-ffmpeg`/`Pillow`/`numpy`(合成)、`requests`(下载)、
 `fastapi`/`uvicorn`/`streamlit`(入口)、`loguru`/`pyyaml`/`python-multipart`。
+
+> 注意：`dashscope` 现在**仅作为 LLM 提供商**保留（不再用于语音识别）。
 
 ---
 
 ## 五、配置变更（`config.example.toml`）
 
-- `subtitle_provider`：语义改为 ASR 选择，默认 `"whisper"`，可选 `"dashscope"`
-  （或在 schema 用 `asr_provider`，二者取其一，建议统一）。
-- `[whisper] model_size = "large-v3"`（中文最准；CPU 慢可改 medium）。
-- 新增（可选）`[dashscope] api_key`，或直接复用 `qwen_api_key`。
+- `subtitle_provider`：固定为 `"whisper"`（不再需要在线选项）。
+- `[whisper] model_size = "small"`（按你的要求默认 small；中文够用、下载小、速度快）。
 - TTS / BGM / upload_post 配置项**保留但注释“新流程未使用”**。
 
 ---
@@ -227,7 +227,7 @@ def combine_videos_by_timeline(
 ## 六、建议实施顺序
 
 1. `schema.py` 加字段（最小、向后兼容）。
-2. `subtitle.py` 加 `create_by_dashscope()`（本地 whisper 已可用，先打通在线）。
+2. `subtitle.py` 确认 whisper 默认模型改为 `small`（本地已可用，无需新增识别方式）。
 3. `material.py` 加 `download_one_video()`。
 4. `video.py` 加 `combine_videos_by_timeline()`（核心，单独写脚本测一段音频）。
 5. `llm.py` 让 `generate_terms()` 支持“单句→英文关键词”。
@@ -244,7 +244,7 @@ def combine_videos_by_timeline(
 - **画面切换太碎**：中文一句可能只有 1~2 秒，画面频繁闪。用 `min_scene_duration`
   把过短的相邻句合并成一个画面（在 `build_segments_and_materials` 里做）。
 - **Pexels 配额**：按句下载请求量大，用多 key 轮询（已支持）+ 失败降级兜底。
-- **whisper large-v3 在 CPU 上很慢**：无 GPU 时长音频识别耗时明显，可优先选 dashscope 在线。
+- **whisper 在 CPU 上的速度**：默认用 `small` 模型，CPU 上也能接受；若识别不准可手动调大到 medium。
 - **素材时长不足该句**：不变速前提下用“循环/定格尾帧”，避免黑屏或拉伸变形。
 - **字幕与音频对齐**：直接用 ASR 时间戳，天然对齐，无需 `subtitle.correct()`。
 
@@ -252,7 +252,7 @@ def combine_videos_by_timeline(
 
 ## 八、改之前可再拍板的细节（非阻塞）
 
-1. **DashScope key**：复用现有 `qwen_api_key`，还是新建 `[dashscope] api_key`？（建议复用）
-2. **素材搜不到的兜底**：通用关键词兜底 / 复用上一句画面 / 纯色背景？（建议：先备用源，再通用词，最后复用上一句）
-3. **画面比例默认**：竖屏 9:16 还是横屏 16:9？（Pexels 竖屏少、Coverr 偏横屏）
-4. **最短画面时长默认值**：建议 2 秒，可在界面调。
+1. **素材搜不到的兜底**：通用关键词兜底 / 复用上一句画面 / 纯色背景？（建议：先备用源，再通用词，最后复用上一句）
+2. **画面比例默认**：竖屏 9:16 还是横屏 16:9？（Pexels 竖屏少、Coverr 偏横屏）
+3. **最短画面时长默认值**：建议 2 秒，可在界面调。
+4. **whisper 模型**：默认 `small`；如果中文识别不够准，是否允许界面切换到 medium？（建议保留可调）

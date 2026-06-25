@@ -10,9 +10,9 @@
 
 | # | 文件 | 改动要点 | 优先级 |
 |---|------|----------|--------|
-| 1 | `app/models/schema.py` | `VideoParams` 新增字段：`segment_mode`（句子/固定时长）、`min_clip_seconds` 等；TTS/BGM 相关字段保留但标注废弃。新增 ASR provider 相关字段（whisper/dashscope）。 | 高 |
-| 2 | `app/services/task.py` | 重排 `start()` 流程：跳过 `generate_script`/`generate_terms` 的强制 LLM 生成；`generate_audio` 只走「自定义音频」分支；字幕强制走 whisper/dashscope；**新增按字幕时间线匹配画面**的逻辑；注释第 7 步 `upload_post` 跨平台发布。 | 高 |
-| 3 | `app/services/subtitle.py` | whisper 本地识别保留（已是句子级带时间戳，基本不动）；**新增 DashScope（paraformer）在线识别**函数，按 `subtitle_provider` 切换。 | 高 |
+| 1 | `app/models/schema.py` | `VideoParams` 新增字段：`min_scene_duration`、`keyword_by_llm` 等；TTS/BGM 相关字段保留但标注废弃。ASR 固定本地 whisper，无需 provider 字段。 | 高 |
+| 2 | `app/services/task.py` | 重排 `start()` 流程：跳过 `generate_script`/`generate_terms` 的强制 LLM 生成；`generate_audio` 只走「自定义音频」分支；字幕强制走本地 whisper；**新增按字幕时间线匹配画面**的逻辑；注释第 7 步 `upload_post` 跨平台发布。 | 高 |
+| 3 | `app/services/subtitle.py` | whisper 本地识别保留（已是句子级带时间戳，基本不动）；只需把默认模型改成 `small`。**不新增在线识别**（DashScope 方案已取消）。 | 高 |
 | 4 | `app/services/material.py` | 保留 Pexels/Pixabay/Coverr 在线下载；**新增「按单句关键词下载/匹配一个素材」**的函数，供时间线拼接调用。 | 高 |
 | 5 | `app/services/video.py` | **新增 `combine_videos_by_timeline()`**：按每句字幕的 `start/end` 决定每段画面时长（现有 `combine_videos` 只按音频总时长堆素材，不看时间戳，必须新增）。`generate_video`（烧字幕）保留。 | 高 |
 | 6 | `app/services/llm.py` | 保留多 provider（你要求全保留）；**新增 / 复用「单句中文 → 英文画面关键词」**的函数（中文直接搜 Pexels 命中率低，需 LLM 提炼英文词）。`dashscope`、`google.generativeai` 已是函数内延迟导入，无需动；`openai` 顶层导入保留。 | 高 |
